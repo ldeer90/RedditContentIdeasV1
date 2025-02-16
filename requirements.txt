@@ -1,6 +1,7 @@
 streamlit
+playwright
 google-generativeai
-requests
 beautifulsoup4
 googlesearch-python
-asyncio
+
+
