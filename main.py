@@ -1,25 +1,25 @@
-import os
 import asyncio
 import re
 import time
+import os
+import requests
+import google.generativeai as genai
+from bs4 import BeautifulSoup
 from nicegui import ui
 from googlesearch import search
-import requests
-from bs4 import BeautifulSoup
-import google.generativeai as genai
 
 # --- Configuration ---
-GOOGLE_API_KEY = "AIzaSyCdoGJ77AtAzw9C7gf7mfk-cKDmUUgkf-4"  # Replace with YOUR API key
+GOOGLE_API_KEY = "AIzaSyCdoGJ77AtAzw9C7gf7mfk-cKDmUUgkf-4"  # If not set, defaults to empty
 genai.configure(api_key=GOOGLE_API_KEY)
-MODEL_NAME = "gemini-2.0-flash-exp"  # Using the flash-exp model
+MODEL_NAME = "gemini-2.0-flash-exp"
 
 # --- Global Variables ---
 process_container = None
 results_container = None
 organized_container = None
-candidate_questions_extracted = []  # List of dicts: {"url": ..., "question": ..., "type": "extracted"}
-candidate_questions_inferred = []   # List of dicts: {"url": ..., "question": ..., "type": "inferred"}
-final_output = ""  # Final organised output in Markdown
+candidate_questions_extracted = []
+candidate_questions_inferred = []
+final_output = ""
 
 def log(message):
     if process_container:
@@ -251,14 +251,14 @@ async def perform_search():
                 ui.label(f"[Raw] Questions from {url}:").classes("font-bold")
                 if extracted:
                     ui.label("Extracted Questions:").classes("underline")
-                    for q in extracted:
-                        ui.label(f"{q} ({url})").classes("text-base")
+                    for line_q in extracted:
+                        ui.label(f"{line_q} ({url})").classes("text-base")
                 else:
                     ui.label("No extracted questions found.").classes("italic")
                 if inferred:
                     ui.label("Inferred Questions:").classes("underline")
-                    for q in inferred:
-                        ui.label(f"{q} ({url})").classes("text-base")
+                    for line_q in inferred:
+                        ui.label(f"{line_q} ({url})").classes("text-base")
             await asyncio.sleep(2)
         log("[Search] Combining all candidate questions and organising them in batches via Gemini...")
         all_candidates = candidate_questions_extracted + candidate_questions_inferred
@@ -297,6 +297,7 @@ with ui.row().classes("p-4"):
 
 log("[Init] Script started.")
 
-port = int(os.getenv("PORT", 10000))  # Default to 10000 if PORT is not set
+port = int(os.getenv("PORT", 10000))
 ui.run(port=port, host="0.0.0.0")
+
 
