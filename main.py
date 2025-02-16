@@ -12,28 +12,16 @@ from googlesearch import search
 GOOGLE_API_KEY = "AIzaSyCdoGJ77AtAzw9C7gf7mfk-cKDmUUgkf-4"  # Replace with YOUR API key
 genai.configure(api_key=GOOGLE_API_KEY)
 MODEL_NAME = "gemini-2.0-flash-exp"  # Using the flash-exp model
-import os
-import re
-import time
-import asyncio
-import requests
-import streamlit as st
-import google.generativeai as genai
-from bs4 import BeautifulSoup
-from googlesearch import search
-
-# Configure Google Generative AI.
-GOOGLE_API_KEY = os.getenv("GOOGLE_API_KEY", "REPLACE_WITH_YOUR_KEY")
-genai.configure(api_key=GOOGLE_API_KEY)
-MODEL_NAME = "gemini-2.0-flash-exp"
 
 # Global variables for candidate questions.
 candidate_questions_extracted = []
 candidate_questions_inferred = []
 final_output = ""
 
-# A simple logger that appends messages to a session-state list.
+# Safe log function: Initializes the key if missing.
 def log(message):
+    if "log_messages" not in st.session_state:
+        st.session_state["log_messages"] = []
     st.session_state["log_messages"].append(message)
 
 def fetch_url(url, headers, timeout=10, retries=3):
@@ -189,6 +177,7 @@ async def organise_batches_iteratively(candidates, batch_size=50):
 
 def main():
     st.title("Reddit Research with Gemini")
+    
     # Initialize session state values if not present.
     if "log_messages" not in st.session_state:
         st.session_state["log_messages"] = []
@@ -197,13 +186,14 @@ def main():
     
     st.write("Enter your search topic below. The app will search Reddit, extract questions, refine them with Gemini, and organise the final output in Markdown.")
 
-    # Using keys to persist input values.
+    # Input elements with explicit keys.
     query = st.text_input("Enter topic", key="query")
     threads_count = st.number_input("Number of threads to check", min_value=1, value=10, key="threads_count")
     questions_per_thread = st.number_input("Number of questions per thread", min_value=1, value=10, key="questions_per_thread")
     truncate_len = st.number_input("Truncation length for Gemini inference", min_value=100, value=10000, key="truncate_len")
     start_button = st.button("Search")
 
+    # Tabs for displaying logs and final output.
     tabs = st.tabs(["Process Log", "Final Organised Output"])
     with tabs[0]:
         st.write("Below is the real-time process log:")
@@ -214,8 +204,9 @@ def main():
         st.markdown(st.session_state["organized_text"])
 
     if start_button:
-        # Debug: Log the received query value.
+        # Log the received query value for debugging.
         log(f"[Debug] Query received: '{st.session_state.get('query', '')}'")
+        # Clear previous logs and output.
         st.session_state["log_messages"].clear()
         st.session_state["organized_text"] = ""
         asyncio.run(run_search(st.session_state.get("query", ""), threads_count, questions_per_thread, truncate_len))
@@ -250,8 +241,8 @@ async def run_search(query, threads_count, questions_count, truncate_len):
             continue
 
         log(f"[Search] Fetched HTML from {url} (length: {len(html)})")
+        # Here we only accumulate inferred questions.
         _, inferred = await get_thread_questions(html, url, questions_count, truncate_len)
-        # For this example, we only accumulate inferred questions.
         for q in inferred:
             candidate_questions_inferred.append({"url": url, "question": q, "type": "inferred"})
         await asyncio.sleep(1)
