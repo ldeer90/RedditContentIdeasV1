@@ -1,7 +1,5 @@
 streamlit
-playwright
+cloudscraper
 google-generativeai
 beautifulsoup4
 googlesearch-python
-
-
