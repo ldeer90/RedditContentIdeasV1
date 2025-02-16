@@ -8,17 +8,17 @@ import google.generativeai as genai
 from bs4 import BeautifulSoup
 from googlesearch import search
 
-# --- Configuration ---
-GOOGLE_API_KEY = "AIzaSyCdoGJ77AtAzw9C7gf7mfk-cKDmUUgkf-4"  # Replace with YOUR API key
+# Hardcoded API key for Google Generative AI
+GOOGLE_API_KEY = "AIzaSyCdoGJ77AtAzw9C7gf7mfk-cKDmUUgkf-4"
 genai.configure(api_key=GOOGLE_API_KEY)
-MODEL_NAME = "gemini-2.0-flash-exp"  # Using the flash-exp model
+MODEL_NAME = "gemini-2.0-flash-exp"
 
 # Global variables for candidate questions.
 candidate_questions_extracted = []
 candidate_questions_inferred = []
 final_output = ""
 
-# Safe log function: Initializes the key if missing.
+# Log function: ensure session_state["log_messages"] is initialized.
 def log(message):
     if "log_messages" not in st.session_state:
         st.session_state["log_messages"] = []
@@ -178,22 +178,22 @@ async def organise_batches_iteratively(candidates, batch_size=50):
 def main():
     st.title("Reddit Research with Gemini")
     
-    # Initialize session state values if not present.
+    # Initialize session state values if not already set.
     if "log_messages" not in st.session_state:
         st.session_state["log_messages"] = []
     if "organized_text" not in st.session_state:
         st.session_state["organized_text"] = ""
     
     st.write("Enter your search topic below. The app will search Reddit, extract questions, refine them with Gemini, and organise the final output in Markdown.")
-
+    
     # Input elements with explicit keys.
     query = st.text_input("Enter topic", key="query")
     threads_count = st.number_input("Number of threads to check", min_value=1, value=10, key="threads_count")
     questions_per_thread = st.number_input("Number of questions per thread", min_value=1, value=10, key="questions_per_thread")
     truncate_len = st.number_input("Truncation length for Gemini inference", min_value=100, value=10000, key="truncate_len")
     start_button = st.button("Search")
-
-    # Tabs for displaying logs and final output.
+    
+    # Display tabs for process log and final output.
     tabs = st.tabs(["Process Log", "Final Organised Output"])
     with tabs[0]:
         st.write("Below is the real-time process log:")
@@ -202,14 +202,17 @@ def main():
     with tabs[1]:
         st.write("Organised Questions in Markdown:")
         st.markdown(st.session_state["organized_text"])
-
+    
     if start_button:
-        # Log the received query value for debugging.
         log(f"[Debug] Query received: '{st.session_state.get('query', '')}'")
-        # Clear previous logs and output.
         st.session_state["log_messages"].clear()
         st.session_state["organized_text"] = ""
-        asyncio.run(run_search(st.session_state.get("query", ""), threads_count, questions_per_thread, truncate_len))
+        # Run the search asynchronously without blocking the UI.
+        st.experimental_run_async(
+            run_search,
+            args=(st.session_state.get("query", ""), threads_count, questions_per_thread, truncate_len),
+            key="run_search_task"
+        )
 
 async def run_search(query, threads_count, questions_count, truncate_len):
     global candidate_questions_extracted, candidate_questions_inferred, final_output
@@ -218,7 +221,7 @@ async def run_search(query, threads_count, questions_count, truncate_len):
     if not query.strip():
         log("[Error] Please enter a valid topic.")
         return
-
+    
     log(f"[Search] Starting search for: '{query} site:reddit.com'")
     try:
         search_results = list(search(f"{query} site:reddit.com", num_results=threads_count))
@@ -226,7 +229,7 @@ async def run_search(query, threads_count, questions_count, truncate_len):
     except Exception as e:
         log(f"[Search] Error during Google search: {e}")
         return
-
+    
     for url in search_results:
         if "reddit.com" not in url:
             log(f"[Search] Skipping non-Reddit URL: {url}")
@@ -234,19 +237,19 @@ async def run_search(query, threads_count, questions_count, truncate_len):
         log(f"[Search] Processing URL: {url}")
         if "old.reddit.com" not in url:
             url = url.replace("www.reddit.com", "old.reddit.com")
-
+        
         html = await asyncio.to_thread(fetch_url, url, {"User-Agent": "Mozilla/5.0"})
         if not html:
             log(f"[Search] Skipping {url} due to fetch failure.")
             continue
-
+        
         log(f"[Search] Fetched HTML from {url} (length: {len(html)})")
         # Here we only accumulate inferred questions.
         _, inferred = await get_thread_questions(html, url, questions_count, truncate_len)
         for q in inferred:
             candidate_questions_inferred.append({"url": url, "question": q, "type": "inferred"})
         await asyncio.sleep(1)
-
+    
     all_candidates = candidate_questions_extracted + candidate_questions_inferred
     log("[Search] Combining all candidate questions and organising them in batches via Gemini...")
     final_output = await organise_batches_iteratively(all_candidates, batch_size=50)
