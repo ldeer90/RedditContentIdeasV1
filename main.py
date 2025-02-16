@@ -271,4 +271,44 @@ def run_search(query: str, threads_count: int, questions_count: int, truncate_le
     log(f"[Search] Searching for: '{query} site:reddit.com'")
     try:
         results = list(search(f"{query} site:reddit.com", num_results=threads_count))
-        log(f"[
+        log(f"[Search] Found {len(results)} URLs for query '{query}'.")
+    except Exception as e:
+        log(f"[Search] Google search error: {e}")
+        return
+
+    # For each URL, fetch HTML & process
+    for url in results:
+        if "reddit.com" not in url:
+            log(f"[Search] Skipping non-Reddit URL: {url}")
+            continue
+        # Convert to old.reddit format
+        if "old.reddit.com" not in url:
+            url = url.replace("www.reddit.com", "old.reddit.com")
+
+        log(f"[Search] Now fetching HTML from: {url}")
+        html = fetch_url(url, HEADERS)
+        if not html:
+            log(f"[Search] Skipping {url} due to fetch failure.")
+            continue
+
+        # Extract & refine
+        raw_extracted = extract_questions(html)[:questions_count]
+        refined = refine_extracted_questions(raw_extracted, url)
+
+        # Infer extra
+        inferred = infer_extra_questions(html, url, questions_count, truncate_len)
+
+        # Collect final
+        for q in refined:
+            extracted_candidates.append({"url": url, "question": q, "type": "extracted"})
+        for q in inferred:
+            inferred_candidates.append({"url": url, "question": q, "type": "inferred"})
+
+    all_candidates = extracted_candidates + inferred_candidates
+    log(f"[Search] Combined total of {len(all_candidates)} questions. Now organising via Gemini.")
+    final_markdown = organise_questions(all_candidates, batch_size=50)
+    st.session_state["organized_text"] = final_markdown
+    log("[Search] Finished. Check the final organised output above.")
+
+if __name__ == "__main__":
+    main()
