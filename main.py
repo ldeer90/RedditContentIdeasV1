@@ -2,7 +2,6 @@ import os
 import re
 import time
 import asyncio
-import threading
 import requests
 import streamlit as st
 import google.generativeai as genai
@@ -19,14 +18,23 @@ candidate_questions_extracted = []
 candidate_questions_inferred = []
 final_output = ""
 
+# Initialize session state keys.
+if "log_messages" not in st.session_state:
+    st.session_state["log_messages"] = []
+if "organized_text" not in st.session_state:
+    st.session_state["organized_text"] = ""
+
+# Create placeholders for logs and final output.
+log_placeholder = st.empty()
+output_placeholder = st.empty()
+
 def log(message):
-    """Append a log message to session state."""
-    if "log_messages" not in st.session_state:
-        st.session_state["log_messages"] = []
+    """Append a message to the log and update the placeholder."""
     st.session_state["log_messages"].append(message)
+    log_placeholder.text("\n".join(st.session_state["log_messages"]))
 
 def fetch_url(url, headers, timeout=10, retries=3):
-    """Fetch the given URL with retries."""
+    """Fetch a URL with retries."""
     for attempt in range(retries):
         log(f"[Fetch] Attempt {attempt+1}: Fetching {url}")
         try:
@@ -41,7 +49,7 @@ def fetch_url(url, headers, timeout=10, retries=3):
     return None
 
 def extract_questions(html):
-    """Extract sentences that look like questions from HTML text."""
+    """Extract sentences that appear to be questions."""
     soup = BeautifulSoup(html, "html.parser")
     text = soup.get_text(separator=" ")
     sentences = re.split(r'(?<=[.?!])\s+', text)
@@ -59,15 +67,13 @@ def extract_questions(html):
     return questions
 
 async def assess_questions_relevance(questions, url):
-    """Use Gemini to rewrite candidate questions into refined search queries."""
+    """Call Gemini to rewrite candidate questions."""
     if not questions:
         return []
     prompt = (
         f"Below are candidate questions extracted from a Reddit thread (source: {url}):\n" +
         "\n".join([f"{i+1}. {q}" for i, q in enumerate(questions)]) +
-        "\n\nRewrite these as professional, natural search queries in plain language that someone would actually type into google. "
-        "Avoid clickbait or headline-like language. Only include the questions that are highly relevant and actionable. "
-        "Output your answer as a numbered list."
+        "\n\nRewrite these as professional, natural search queries in plain language that someone would actually type into google. Avoid clickbait or headline-like language. Only include the questions that are highly relevant and actionable. Output your answer as a numbered list."
     )
     try:
         model = genai.GenerativeModel(MODEL_NAME)
@@ -91,16 +97,15 @@ async def assess_questions_relevance(questions, url):
         return questions
 
 async def get_thread_questions(html, url, desired_count, trunc_length):
-    """Extract and refine questions from the thread HTML."""
+    """Extract questions from a thread and refine them with Gemini."""
     log(f"[Extract] Extracting candidate questions from {url}")
     extracted = extract_questions(html)[:desired_count]
     rewritten_extracted = await assess_questions_relevance(extracted, url)
     inferred = []
     prompt = (
         f"Based on the following Reddit thread content (source: {url}), list exactly {desired_count} additional relevant questions "
-        "rephrased as natural search queries in plain, professional Australian English. "
-        "The questions should be written exactly as someone would type them into google, avoiding any clickbait or headline-like formatting. "
-        "Please output your response as a numbered list. If you cannot generate exactly the requested number, list as many as possible.\n\n"
+        "rephrased as natural search queries in plain, professional Australian English. The questions should be written exactly as someone would type them into google, "
+        "avoiding any clickbait or headline-like formatting. Please output your response as a numbered list. If you cannot generate exactly the requested number, list as many as possible.\n\n"
         f"Thread content (truncated to {trunc_length} characters):\n{html[:trunc_length]}"
     )
     log(f"[Infer] Prompting Gemini to infer {desired_count} additional questions for {url}.")
@@ -124,7 +129,7 @@ async def get_thread_questions(html, url, desired_count, trunc_length):
     return rewritten_extracted, inferred
 
 async def call_gemini(prompt, retries=10, max_tokens=2000):
-    """Call Gemini with retries."""
+    """Call Gemini with retry logic."""
     model = genai.GenerativeModel(MODEL_NAME)
     backoff_seconds = 2
     for attempt in range(retries):
@@ -151,15 +156,13 @@ async def call_gemini(prompt, retries=10, max_tokens=2000):
     raise RuntimeError(f"Gemini call failed after {retries} attempts.")
 
 async def organise_batches_iteratively(candidates, batch_size=50):
-    """Organise candidate questions into groups using Gemini."""
+    """Organise candidate questions into categories using Gemini."""
     if not candidates:
         return "No candidate questions available for organisation."
     batches = [candidates[i:i+batch_size] for i in range(0, len(candidates), batch_size)]
     current_output = ""
     for i, batch in enumerate(batches):
-        batch_text = "\n".join(
-            [f"{item['question']} [{item['type'].capitalize()}] ({item['url']})" for item in batch]
-        )
+        batch_text = "\n".join([f"{item['question']} [{item['type'].capitalize()}] ({item['url']})" for item in batch])
         if i == 0:
             prompt = (
                 "Rewrite and group the following candidate questions into multiple, specific topical categories for blog research. "
@@ -173,7 +176,8 @@ async def organise_batches_iteratively(candidates, batch_size=50):
             prompt = (
                 "Below is the previously organised output in Markdown:\n" + current_output + "\n\n"
                 "Now, here are additional candidate questions:\n" + batch_text + "\n\n"
-                "Update the organised output to incorporate the new candidate questions. Rewrite all candidate questions as natural search queries in plain language exactly as someone would type into google. Avoid any clickbait or headline-like language. Group the questions into appropriate topics and output the result in the exact Markdown format as before, containing only questions."
+                "Update the organised output to incorporate the new candidate questions. Rewrite all candidate questions as natural search queries in plain language exactly as someone would type into google. Avoid any clickbait or headline-like language. "
+                "Group the questions into appropriate topics and output the result in the exact Markdown format as before, containing only questions."
             )
         log(f"[Batch] Processing batch {i+1} of {len(batches)} with {len(batch)} candidate questions.")
         batch_output = await call_gemini(prompt, max_tokens=2000)
@@ -186,12 +190,6 @@ async def organise_batches_iteratively(candidates, batch_size=50):
 def main():
     st.title("Reddit Research with Gemini")
     
-    # Initialize session state if not set.
-    if "log_messages" not in st.session_state:
-        st.session_state["log_messages"] = []
-    if "organized_text" not in st.session_state:
-        st.session_state["organized_text"] = ""
-    
     st.write("Enter your search topic below. The app will search Reddit, extract questions, refine them with Gemini, and organise the final output in Markdown.")
     
     # Input elements.
@@ -201,32 +199,29 @@ def main():
     truncate_len = st.number_input("Truncation length for Gemini inference", min_value=100, value=10000, key="truncate_len")
     start_button = st.button("Search")
     
-    # Tabs for display.
-    tabs = st.tabs(["Process Log", "Final Organised Output"])
-    with tabs[0]:
-        st.write("Below is the real-time process log:")
-        for msg in st.session_state["log_messages"]:
-            st.write(msg)
-    with tabs[1]:
-        st.write("Organised Questions in Markdown:")
-        st.markdown(st.session_state["organized_text"])
+    # Display current logs and output.
+    st.subheader("Process Log")
+    log_placeholder.text("\n".join(st.session_state["log_messages"]))
+    
+    st.subheader("Final Organised Output")
+    output_placeholder.markdown(st.session_state["organized_text"])
     
     if start_button:
         log(f"[Debug] Query received: '{st.session_state.get('query', '')}'")
         # Reset logs and output.
         st.session_state["log_messages"] = []
         st.session_state["organized_text"] = ""
-        # Run the asynchronous search in a background thread.
-        threading.Thread(
-            target=lambda: asyncio.run(
-                run_search(
-                    st.session_state.get("query", ""),
-                    threads_count,
-                    questions_per_thread,
-                    truncate_len
-                )
-            )
-        ).start()
+        # Run the asynchronous search synchronously with a spinner.
+        with st.spinner("Running search..."):
+            asyncio.run(run_search(
+                st.session_state.get("query", ""),
+                threads_count,
+                questions_per_thread,
+                truncate_len
+            ))
+        # Update the placeholders after completion.
+        log_placeholder.text("\n".join(st.session_state["log_messages"]))
+        output_placeholder.markdown(st.session_state["organized_text"])
 
 async def run_search(query, threads_count, questions_count, truncate_len):
     global candidate_questions_extracted, candidate_questions_inferred, final_output
@@ -272,3 +267,4 @@ async def run_search(query, threads_count, questions_count, truncate_len):
 
 if __name__ == "__main__":
     main()
+
