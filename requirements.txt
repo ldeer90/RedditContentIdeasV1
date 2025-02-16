@@ -1,8 +1,6 @@
-asyncio
-nicegui
-googlesearch-python
+streamlit
+google-generativeai
 requests
 beautifulsoup4
-google-generativeai
-gunicorn
-uvicorn
+googlesearch-python
+asyncio
