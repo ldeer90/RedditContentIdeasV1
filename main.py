@@ -296,4 +296,5 @@ with ui.row().classes("p-4"):
 
 log("[Init] Script started.")
 
-ui.run(port=8080)
+ui.run(port=8080, host="0.0.0.0")
+
