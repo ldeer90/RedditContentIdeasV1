@@ -1,0 +1,7 @@
+asyncio
+nicegui
+googlesearch-python
+requests
+beautifulsoup4
+google-generativeai
+gunicorn
