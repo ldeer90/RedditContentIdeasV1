@@ -1,307 +1,342 @@
-import os
+import asyncio
 import re
-import sys
 import time
+import datetime
 import streamlit as st
-import google.generativeai as genai
-import cloudscraper
+import requests
 from bs4 import BeautifulSoup
 from googlesearch import search
+import google.generativeai as genai
 
-########################################
-#  HARDCODED CONFIG & INITIAL SETUP    #
-########################################
-
-# Hardcoded Google API Key for Gemini (replace if needed).
+# Configure your Google API key for Gemini
 GOOGLE_API_KEY = "AIzaSyCdoGJ77AtAzw9C7gf7mfk-cKDmUUgkf-4"
 genai.configure(api_key=GOOGLE_API_KEY)
 MODEL_NAME = "gemini-2.0-flash-exp"
 
-# We create a cloudscraper session at the top level so we don’t recreate it each time.
-scraper = cloudscraper.create_scraper()
+st.set_page_config(layout="centered")
+st.title("Question Forum Finder")
 
-# Initialise session state for logs and final markdown output.
-if "log_messages" not in st.session_state:
-    st.session_state["log_messages"] = []
-if "organized_text" not in st.session_state:
-    st.session_state["organized_text"] = ""
+if "log_text" not in st.session_state:
+    st.session_state.log_text = ""
 
-########################################
-#          LOGGING FUNCTION            #
-########################################
 
-def log(message: str) -> None:
-    """
-    Append a message to st.session_state logs,
-    so they persist across script reruns.
-    """
-    st.session_state["log_messages"].append(message)
+def log(message):
+    st.session_state.log_text += message + "\n"
 
-def log_startup_details():
-    """
-    Logs environment details for extra diagnostics.
-    """
-    log("[Init] Starting new run.")
-    log(f"[Init] Python version: {sys.version}")
-    log(f"[Init] Working directory: {os.getcwd()}")
-    # If you need environment variables:
-    # for k, v in os.environ.items():
-    #     log(f"[Env] {k}={v}")
 
-########################################
-#      CLOUDSCRAPER FETCH FUNCTION     #
-########################################
-
-def fetch_url(url: str, timeout: int = 10, retries: int = 3) -> str:
-    """
-    Uses cloudscraper to retrieve HTML from a URL, with a few retries.
-    Logs any errors or success messages.
-    """
-    content = ""
+def fetch_url(url, headers, timeout=10, retries=3):
     for attempt in range(retries):
-        log(f"[Fetch] Attempt {attempt+1}: Fetching {url}")
+        log(f"[Fetch] Attempt {attempt + 1}: Fetching {url}")
         try:
-            response = scraper.get(url, timeout=timeout)
+            response = requests.get(url, headers=headers, timeout=timeout)
             response.raise_for_status()
-            content = response.text
-            log(f"[Fetch] Success: {url} returned HTTP {response.status_code}")
-            return content
-        except Exception as e:
-            log(f"[Fetch] Error on attempt {attempt+1} for {url}: {e}")
+            log(f"[Fetch] {url} returned HTTP status {response.status_code}")
+            return response.text
+        except requests.exceptions.RequestException as e:
+            log(f"[Fetch] Error on attempt {attempt + 1} for {url}: {e}")
             time.sleep(2)
     log(f"[Fetch] Failed to fetch {url} after {retries} attempts.")
-    return content
+    return None
 
-########################################
-#      EXTRACT QUESTIONS (HTML)        #
-########################################
 
-def extract_questions(html: str) -> list[str]:
-    """
-    Splits HTML text into sentences and picks out those containing a question mark,
-    ignoring very short or spammy lines.
-    """
+def extract_questions(html, source="generic"):
     soup = BeautifulSoup(html, "html.parser")
-    text = soup.get_text(separator=" ")
+
+    # Remove the head section entirely
+    if soup.head:
+        soup.head.decompose()
+
+    # Remove common non-content tags
+    for tag in soup(["script", "style", "meta", "link", "noscript", "header", "footer", "nav", "aside"]):
+        tag.decompose()
+
+    # Attempt to restrict parsing to the main content container
+    text = ""
+    if source == "quora":
+        # For Quora, the user-generated content is usually inside a div with classes like "q-box" and "quora-rich-text--renderer"
+        main_content = soup.find("div", class_=lambda x: x and "q-box" in x and "quora-rich-text" in x)
+        if main_content:
+            text = main_content.get_text(separator=" ")
+        else:
+            text = soup.get_text(separator=" ")
+    elif source == "reddit":
+        # For Reddit, most user text is within a div with class "usertext-body"
+        main_content = soup.find("div", class_=lambda x: x and "usertext-body" in x)
+        if main_content:
+            text = main_content.get_text(separator=" ")
+        else:
+            text = soup.get_text(separator=" ")
+    else:
+        text = soup.get_text(separator=" ")
+
+    # Now split text into sentences and filter for questions
     sentences = re.split(r'(?<=[.?!])\s+', text)
     questions = []
     for sentence in sentences:
         sentence = sentence.strip()
         if "?" in sentence and len(sentence) > 25:
-            if any(
-                keyword in sentence.lower()
-                for keyword in ["add to the discussion", "vote", "comment", "submit", "loading", "http"]
-            ):
+            lower = sentence.lower()
+            if any(keyword in lower for keyword in
+                   ["add to the discussion", "vote", "comment", "submit", "read more", "loading", "http", "www."]):
                 continue
             if sentence not in questions:
                 questions.append(sentence)
-    log(f"[Extract] Found {len(questions)} potential questions in HTML.")
     return questions
 
-########################################
-#        GEMINI CALLS (SYNC)           #
-########################################
 
-def call_gemini(prompt: str, max_tokens: int = 300) -> str:
-    """
-    Calls Google's Gemini model in a blocking manner,
-    logs the prompt length and any errors or successes.
-    """
-    log(f"[Gemini] Sending request (prompt length: {len(prompt)} chars)...")
+async def assess_questions_relevance(questions, url):
+    if not questions:
+        return []
+    prompt = (
+            f"Below are candidate questions extracted from a thread (source: {url}):\n" +
+            "\n".join([f"{i + 1}. {q}" for i, q in enumerate(questions)]) +
+            "\n\nRewrite these as professional, natural search queries in plain language that someone would type into Google. Avoid clickbait or headline-like language. Only include relevant and actionable ones. Output your answer as a numbered list."
+    )
     try:
         model = genai.GenerativeModel(MODEL_NAME)
-        response = model.generate_content(
+        response = await asyncio.to_thread(
+            model.generate_content,
             prompt,
-            generation_config={"temperature": 0.5, "max_output_tokens": max_tokens}
+            generation_config={"temperature": 0.5, "max_output_tokens": 300}
+        )
+        if not response or not response.text:
+            return []
+        lines = response.text.splitlines()
+        rewritten = []
+        for line in lines:
+            line = line.strip()
+            if line.lower() == "none":
+                return []
+            match = re.match(r'^\d+\.\s*(.*)', line)
+            if match:
+                rewritten.append(match.group(1).strip())
+        log(f"[Relevance] Rewritten {len(rewritten)} extracted questions from {url}.")
+        return rewritten
+    except Exception as e:
+        log(f"[Relevance] Error rewriting questions for {url}: {e}")
+        return questions
+
+
+async def get_thread_questions(html, url, desired_count, trunc_length):
+    log(f"[Extract] Extracting candidate questions from {url}")
+    # Use specific extraction based on source
+    if "quora.com" in url:
+        extracted = extract_questions(html, source="quora")
+    else:
+        extracted = extract_questions(html, source="generic")
+    extracted = extracted[:desired_count]
+    rewritten_extracted = await assess_questions_relevance(extracted, url)
+    missing = desired_count
+    prompt = (
+            f"Based on the following thread content (source: {url}), list exactly {missing} additional relevant questions rephrased as natural search queries in plain, professional Australian English. " +
+            f"Output them as a numbered list, avoiding clickbait or headline-like language. If you cannot generate all {missing}, list as many as possible.\n\n" +
+            f"Thread content (truncated to {trunc_length} characters):\n{html[:trunc_length]}"
+    )
+    log(f"[Infer] Prompting Gemini to infer {missing} additional questions for {url}.")
+    inferred = []
+    try:
+        model = genai.GenerativeModel(MODEL_NAME)
+        response = await asyncio.to_thread(
+            model.generate_content,
+            prompt,
+            generation_config={"temperature": 0.5, "max_output_tokens": 300}
         )
         if response and response.text:
-            log(f"[Gemini] Received response (length: {len(response.text)} chars).")
-            return response.text
-        else:
-            log("[Gemini] No valid response from Gemini.")
+            additional_text = response.text
+            log(f"[Infer] Raw inferred text: {additional_text}")
+            for line in additional_text.splitlines():
+                line = line.strip()
+                match = re.match(r'^\d+\.\s*(.*)', line)
+                if match:
+                    inferred.append(match.group(1).strip())
+            log(f"[Infer] Inferred {len(inferred)} additional questions from {url}.")
     except Exception as e:
-        log(f"[Gemini] Error: {e}")
-    return ""
+        log(f"[Infer] Error inferring questions for {url}: {e}")
+    return rewritten_extracted, inferred
 
-def refine_extracted_questions(questions: list[str], url: str) -> list[str]:
-    """
-    Uses Gemini to rewrite extracted questions into natural search queries.
-    """
-    if not questions:
-        log(f"[Refine] No questions to refine for {url}.")
-        return []
-    prompt = (
-        f"Below are candidate questions extracted from a Reddit thread (source: {url}):\n"
-        + "\n".join([f"{i+1}. {q}" for i, q in enumerate(questions)])
-        + "\n\nRewrite these as professional, natural search queries in plain language that someone would type into google, "
-          "avoiding clickbait. Output them as a numbered list."
-    )
-    log(f"[Refine] Refining {len(questions)} extracted questions from {url}...")
-    raw_text = call_gemini(prompt, max_tokens=300)
-    refined = []
-    for line in raw_text.splitlines():
-        line = line.strip()
-        if re.match(r'^\d+\.', line):
-            parts = line.split(". ", 1)
-            refined.append(parts[1].strip() if len(parts) > 1 else line)
-    log(f"[Refine] Final refined question count: {len(refined)}.")
-    return refined
 
-def infer_extra_questions(html: str, url: str, desired_count: int, truncate_len: int) -> list[str]:
-    """
-    Asks Gemini to infer additional questions from the given HTML content.
-    """
-    if desired_count < 1:
-        return []
-    truncated_text = html[:truncate_len]
-    prompt = (
-        f"Based on the following Reddit thread content (source: {url}), list exactly {desired_count} additional relevant questions "
-        "rephrased as natural search queries in plain, professional Australian English. Output them as a numbered list. "
-        "If you cannot generate exactly the requested number, list as many as possible.\n\n"
-        f"Thread content (truncated to {truncate_len} chars):\n{truncated_text}"
-    )
-    log(f"[Infer] Inferring {desired_count} extra questions for {url}...")
-    raw_text = call_gemini(prompt, max_tokens=300)
-    inferred = []
-    for line in raw_text.splitlines():
-        line = line.strip()
-        if re.match(r'^\d+\.', line):
-            parts = line.split(". ", 1)
-            inferred.append(parts[1].strip() if len(parts) > 1 else line)
-    log(f"[Infer] Inferred {len(inferred)} extra questions.")
-    return inferred
+async def call_gemini(prompt, retries=10, max_tokens=2000):
+    model = genai.GenerativeModel(MODEL_NAME)
+    backoff_seconds = 2
+    for attempt in range(retries):
+        try:
+            log(f"[Gemini] Attempt {attempt + 1}: Calling Gemini...")
+            response = await asyncio.to_thread(
+                model.generate_content,
+                prompt,
+                generation_config={"temperature": 0.5, "max_output_tokens": max_tokens}
+            )
+            if response and response.text:
+                log("[Gemini] Gemini call successful.")
+                return response.text
+            else:
+                log("[Gemini] Gemini call did not return a valid result.")
+        except Exception as e:
+            error_message = str(e)
+            if "429" in error_message:
+                log(f"[Gemini] 429 error detected on attempt {attempt + 1}, delaying further attempts.")
+            else:
+                log(f"[Gemini] Error during Gemini call: {e} (Attempt {attempt + 1})")
+        await asyncio.sleep(backoff_seconds)
+        backoff_seconds *= 2
+    raise RuntimeError(f"Gemini call failed after {retries} attempts.")
 
-########################################
-#  ORGANISE QUESTIONS INTO MARKDOWN    #
-########################################
 
-def organise_questions(candidates: list[dict], batch_size: int = 50) -> str:
-    """
-    Groups candidate questions into categories using Gemini,
-    outputting them in Markdown.
-    """
+def display_questions_in_expanders(markdown_text):
+    categories = [cat.strip() for cat in markdown_text.split("###") if cat.strip()]
+    for cat in categories:
+        lines = cat.splitlines()
+        if not lines:
+            continue
+        header = lines[0].strip()
+        content_lines = lines[1:]
+        with st.expander(header):
+            for line in content_lines:
+                if line.strip().startswith("- "):
+                    st.markdown(line)
+
+
+async def organise_batches_iteratively(candidates, batch_size=50):
     if not candidates:
-        log("[Organise] No candidate questions available.")
-        return "No candidate questions available."
-
-    log(f"[Organise] Organising {len(candidates)} total questions in batches of {batch_size}.")
-    final_md = ""
-    batches = [candidates[i:i+batch_size] for i in range(0, len(candidates), batch_size)]
+        return "No candidate questions available for organisation."
+    batches = [candidates[i:i + batch_size] for i in range(0, len(candidates), batch_size)]
+    current_output = ""
     for i, batch in enumerate(batches):
         batch_text = "\n".join(
-            f"{item['question']} [{item['type'].capitalize()}] ({item['url']})"
-            for item in batch
-        )
+            [f"{item['question']} [Source: {item['source'].capitalize()}] ({item['url']})" for item in batch])
         if i == 0:
             prompt = (
-                "Rewrite and group the following candidate questions into multiple, specific topical categories for blog research. "
-                "Each question must be a natural search query in plain language exactly as someone would type into google, avoiding clickbait. "
-                "Output the final result in the exact Markdown format below. Only questions.\n\n"
-                "### [Category Title]\n"
-                "- [Rewritten Question] ([reddit thread URL])\n\n"
-                f"Candidate Questions:\n{batch_text}"
+                    "Rewrite and group the following candidate questions into categories for blog research. Within each category, group questions by their source domain. " +
+                    "Each candidate question should be a natural query that someone would type into Google, avoiding clickbait or headline style. " +
+                    "Output it all in Markdown with headings and bullet points for questions. The format is:\n\n" +
+                    "### [Category Title]\n" +
+                    "- [Rewritten Question] (Source: [Domain]) ([Source URL])\n\n" +
+                    "Candidate Questions:\n" + batch_text
             )
         else:
             prompt = (
-                f"Previously organised output:\n{final_md}\n\n"
-                f"Now add these new questions:\n{batch_text}\n\n"
-                "Rewrite them as natural search queries in plain language, grouping them into relevant categories. "
-                "Output everything in the same Markdown format. Only questions."
+                    "Below is the previously organised output in Markdown:\n" + current_output + "\n\n" +
+                    "Here are additional candidate questions:\n" + batch_text + "\n\n" +
+                    "Update the organised output so that the questions are grouped by topic and also by their source within each category. " +
+                    "Use the same Markdown format and avoid any clickbait or headline language."
             )
-        log(f"[Organise] Processing batch {i+1}/{len(batches)}, size={len(batch)}.")
-        raw_md = call_gemini(prompt, max_tokens=800)
-        if raw_md:
-            final_md = raw_md
-    return final_md
+        log(f"[Batch] Processing batch {i + 1} of {len(batches)} with {len(batch)} candidate questions.")
+        batch_output = await call_gemini(prompt, max_tokens=2000)
+        current_output = batch_output
+        log(f"[Batch] Batch {i + 1} processed.")
+        await asyncio.sleep(1)
+    return current_output
 
-########################################
-#   MAIN STREAMLIT UI & LOGIC          #
-########################################
 
-def main():
-    log_startup_details()
-    st.title("Reddit Research with Gemini (cloudscraper Edition)")
-    st.write(
-        "Enter a search topic and parameters. We'll search Reddit using cloudscraper, "
-        "refine/infer questions via Gemini, and organise them. Logs below help diagnose any issues."
-    )
+async def perform_search(query, threads_count, questions_per_thread, trunc_length, reddit_on, quora_on, whirlpool_on,
+                         top_container, start_date, end_date):
+    candidate_questions = []
+    domains_to_use = []
+    if reddit_on:
+        domains_to_use.append("site:reddit.com")
+    if quora_on:
+        domains_to_use.append("site:quora.com")
+    if whirlpool_on:
+        domains_to_use.append("site:whirlpool.net.au")
 
-    query = st.text_input("Enter a search topic", "retirement")
-    threads_count = st.number_input("Number of Reddit threads to check", min_value=1, value=2)
-    questions_per_thread = st.number_input("Number of questions per thread", min_value=1, value=2)
-    truncate_len = st.number_input("Truncation length for Gemini", min_value=100, value=10000)
-
-    if st.button("Search"):
-        # Clear old logs & output
-        st.session_state["log_messages"] = []
-        st.session_state["organized_text"] = ""
-
-        log_startup_details()
-        log(f"[UserInput] query='{query}', threads_count={threads_count}, questions_per_thread={questions_per_thread}, truncate_len={truncate_len}")
-        
-        with st.spinner("Scraping Reddit and calling Gemini..."):
-            run_search(query, threads_count, questions_per_thread, truncate_len)
-
-        st.subheader("Process Log")
-        st.text("\n".join(st.session_state["log_messages"]))
-
-        st.subheader("Final Organised Output")
-        st.markdown(st.session_state["organized_text"])
-
-def run_search(query: str, threads_count: int, questions_count: int, truncate_len: int) -> None:
-    """Synchronous flow: search Reddit, fetch HTML with cloudscraper, refine/infer, organise questions."""
-    if not query.strip():
-        log("[Error] Please enter a valid search topic.")
+    if not domains_to_use:
+        st.write("No sites selected. Please enable at least one checkbox.")
         return
 
-    extracted_candidates = []
-    inferred_candidates = []
+    date_modifiers = ""
+    if start_date and start_date != datetime.date(1970, 1, 1):
+        date_modifiers += f" after:{start_date.strftime('%Y-%m-%d')}"
+    if end_date and end_date != datetime.date(1970, 1, 1):
+        date_modifiers += f" before:{end_date.strftime('%Y-%m-%d')}"
 
-    log(f"[Search] Searching for: '{query} site:reddit.com'")
+    query_string = f"{query} {' OR '.join(domains_to_use)}{date_modifiers}"
+    log(f"[Search] Starting search for: '{query_string}'")
+
     try:
-        results = list(search(f"{query} site:reddit.com", num_results=threads_count))
-        log(f"[Search] Found {len(results)} URLs for query '{query}'.")
+        search_results = list(search(query_string, num_results=threads_count))
+        log(f"[Search] Found {len(search_results)} URLs for query: {query_string}")
     except Exception as e:
-        log(f"[Search] Error during google search: {e}")
+        log(f"[Search] Error during Google search: {e}")
         return
 
-    for url in results:
-        if "reddit.com" not in url:
-            log(f"[Search] Skipping non-Reddit URL: {url}")
+    for url in search_results:
+        if not any(domain[5:] in url for domain in domains_to_use):
+            log(f"[Search] Skipping non-target URL: {url}")
             continue
-
-        # Optionally convert "www.reddit.com" to "old.reddit.com"
-        if "old.reddit.com" not in url:
+        if "reddit.com" in url and "old.reddit.com" not in url:
             url = url.replace("www.reddit.com", "old.reddit.com")
-
-        log(f"[Search] Now fetching HTML from: {url}")
-        html = fetch_url(url, timeout=10, retries=3)
+        html = fetch_url(url, {"User-Agent": "Mozilla/5.0"})
         if not html:
             log(f"[Search] Skipping {url} due to fetch failure.")
             continue
-        log(f"[Search] Fetched HTML from {url} (length: {len(html)}).")
+        log(f"[Search] Fetched HTML from {url} (length: {len(html)})")
 
-        # Extract & refine
-        raw_extracted = extract_questions(html)[:questions_count]
-        refined = refine_extracted_questions(raw_extracted, url)
+        truncated_html = html[:trunc_length] + "\n...[truncated]"
+        st.text_area(f"[Raw] HTML content from {url} (truncated to {trunc_length} chars)", truncated_html, height=200)
 
-        # Infer extra
-        extra = infer_extra_questions(html, url, questions_count, truncate_len)
+        extracted, inferred = await get_thread_questions(html, url, questions_per_thread, trunc_length)
+        log(f"[Search] From {url}: Extracted {len(extracted)} questions; Inferred {len(inferred)} questions.")
 
-        for q in refined:
-            extracted_candidates.append({"url": url, "question": q, "type": "extracted"})
-        for q in extra:
-            inferred_candidates.append({"url": url, "question": q, "type": "inferred"})
+        source_label = "reddit"
+        if "quora.com" in url:
+            source_label = "quora"
+        elif "whirlpool.net.au" in url:
+            source_label = "whirlpool"
 
-    all_candidates = extracted_candidates + inferred_candidates
-    log(f"[Search] Combined total of {len(all_candidates)} candidate questions. Organising them now...")
-    final_markdown = organise_questions(all_candidates, batch_size=50)
-    st.session_state["organized_text"] = final_markdown
-    log("[Search] Finished. Check final output above.")
+        for q in extracted:
+            candidate_questions.append({"url": url, "question": q, "type": "extracted", "source": source_label})
+        for q in inferred:
+            candidate_questions.append({"url": url, "question": q, "type": "inferred", "source": source_label})
 
-########################################
-#             ENTRY POINT              #
-########################################
+        st.write(f"[Raw] Questions from {url}:")
+        if extracted:
+            st.write("Extracted Questions:")
+            for question_text in extracted:
+                st.write(f"{question_text} ({url})")
+        else:
+            st.write("No extracted questions found.")
+        if inferred:
+            st.write("Inferred Questions:")
+            for question_text in inferred:
+                st.write(f"{question_text} ({url})")
+        await asyncio.sleep(2)
 
-if __name__ == "__main__":
-    main()
+    log("[Search] Combining all candidate questions and organising them...")
+    final_output = await organise_batches_iteratively(candidate_questions, batch_size=50)
+    with top_container:
+        st.subheader("Organised Questions")
+        display_questions_in_expanders(final_output)
+        st.download_button("Download Final Organised Output", final_output, "results.md")
+    log("[Search] Process complete.")
+
+
+top_output_container = st.container()
+
+reddit_on = st.checkbox("Search Reddit", value=True)
+quora_on = st.checkbox("Search Quora", value=True)
+whirlpool_on = st.checkbox("Search Whirlpool", value=True)
+
+query = st.text_input("Enter topic", "")
+threads_count = st.number_input("Number of threads to check", min_value=1, value=30)
+questions_per_thread = st.number_input("Number of questions per thread", min_value=1, value=40)
+trunc_length = st.number_input("Truncation length for Gemini inference", min_value=1000, value=10000)
+
+start_date = st.date_input("Start date (optional)", value=None, min_value=datetime.date(2020, 1, 1))
+end_date = st.date_input("End date (optional)", value=None, min_value=datetime.date(2020, 1, 2))
+
+if st.button("Search"):
+    asyncio.run(perform_search(
+        query,
+        threads_count,
+        questions_per_thread,
+        trunc_length,
+        reddit_on,
+        quora_on,
+        whirlpool_on,
+        top_output_container,
+        start_date,
+        end_date
+    ))
+
+st.subheader("Process Log")
+st.text_area("", st.session_state.log_text, height=200)
